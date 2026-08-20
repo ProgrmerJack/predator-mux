@@ -1,0 +1,231 @@
+#!/bin/sh
+# Session-preserving mux switch: move the internal panel between the Intel iGPU
+# and the NVIDIA dGPU WITHOUT restarting Plasma. Apps stay open.
+#
+# Usage: sudo sh live-switch.sh [dgpu|igpu] [nopreops]   (no arg = toggle)
+#
+# By default the full sequence runs: RUN_PRE -> SWITCH -> RUN_POST. Pre/post
+# handle the SOR sequencer, BL GPIO control and the LCD VDD / BL EN / PWM MUX
+# handover. RUN_PRE only works with SR_ENTER_SKIP=YES (nvmuxk defaults
+# srskip=1); the PSR-entry sub-step is the one thing GSP refuses.
+# Switch-only is not sufficient: SWITCH_DISP_MUX can return NV_OK and the mux
+# can reach DISCRETE_GPU while the DRM connector stays disconnected. The full
+# sequence is what brings the connector up, so it is the default.
+#
+#   nopreops : switch only, skipping RUN_PRE/RUN_POST. Use to isolate whether
+#              pre/post are what bring the connector up.
+#
+# Why this works, all verified in source at the installed versions:
+#
+#  1. KWin already has BOTH DRM devices open (/proc/<kwin>/fd shows card0,
+#     card1, renderD128, renderD129), so a connector moving between them is a
+#     hotplug on a device it already manages - not a new-device problem.
+#
+#  2. KWin survives having zero outputs. kwin v6.7.4 src/workspace.cpp:1374
+#         // The workspace requires at least one output connected.
+#         if (newBackendOutputs.isEmpty()) {
+#             m_placeholderOutput = new PlaceholderOutput(QSize(1920, 1080), 1);
+#     It substitutes a virtual output and drops it when a real one returns.
+#     Wayland clients are re-laid-out, not killed. That covers the window in
+#     step 5 where neither GPU owns the panel.
+#
+#  3. Writing a connector's sysfs "status" does NOT notify userspace.
+#     drivers/gpu/drm/drm_sysfs.c status_store() only sets connector->force and
+#     re-runs fill_modes(); there is no drm_kms_helper_hotplug_event() call. So
+#     every forced status change here is followed by an explicit udev trigger.
+#
+#  4. KWin re-probes a GPU on a udev "change" action.
+#     kwin v6.7.4 src/backends/drm/drm_backend.cpp:204
+#         } else if (device->action() == QLatin1StringView("change")) {
+#             DrmGpu *gpu = findGpu(device->devNum());
+#             if (gpu && gpu->isActive()) { updateOutputs(gpu); }
+#     It matches on the primary node name ("card%d"), which is what is triggered.
+#
+# HARD CONSTRAINT (drm_backend.cpp:196): never remove/unbind the primary GPU -
+#     if (primaryGpu() == gpu) { qCCritical(...) << "Primary gpu has been
+#         removed! Quitting..."; QCoreApplication::exit(1); }
+# This script only ever sends "change", never "remove", and never unbinds.
+#
+# card0 = NVIDIA 0000:01:00.0 (eDP-2), card1 = Intel 0000:00:02.0 (eDP-1).
+
+# --- portable paths (bundle) ----------------------------------------------
+# Resolve everything relative to this script so it works wherever it is
+# unpacked. $0 is not
+# reliable after the setsid re-exec, so the absolute path is resolved once here
+# and passed through the environment as MUX_SELF.
+if [ -z "${MUX_SELF:-}" ]; then
+    MUX_SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")"
+fi
+BINDIR=$(dirname -- "$MUX_SELF")
+ROOTDIR=$(CDPATH= cd -- "$BINDIR/.." && pwd)
+DIR="$ROOTDIR/kernel"
+# Fall back to an installed module if this is not a source checkout.
+[ -f "$DIR/nvmuxk.ko" ] || DIR="/lib/modules/$(uname -r)/updates"
+LOGDIR="${MUX_LOG_DIR:-/var/log/predator-mux}"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=/tmp
+NV_CARD=/sys/class/drm/card0
+IG_CARD=/sys/class/drm/card1
+NV_CONN=$NV_CARD-eDP-2
+IG_CONN=$IG_CARD-eDP-1
+IBL=/sys/class/backlight/intel_backlight
+NBL=/sys/class/backlight/nvidia_0
+
+[ "$(id -u)" = 0 ] || { echo "need root: sudo sh $0 $*"; exit 1; }
+
+# Detach. Plasma is NOT restarted here, but during the placeholder window the
+# terminal is not on screen; running detached keeps the switch alive regardless
+# of what happens to the launching shell.
+if [ "${CHILD:-0}" != 1 ]; then
+    LOGF="$LOGDIR/live-$(date +%Y%m%d-%H%M%S).log"
+    echo "live switch starting (session preserved). log: $LOGF"
+    CHILD=1 LOGF="$LOGF" TARGET="$1" PREOPS="$2" MUX_SELF="$MUX_SELF" setsid nohup sh "$MUX_SELF" >/dev/null 2>&1 </dev/null &
+    sleep 1; exit 0
+fi
+
+log() { echo "$@" >> "$LOGF"; sync; }
+
+# --- direction -------------------------------------------------------------
+if [ "$TARGET" = dgpu ] || [ "$TARGET" = igpu ]; then
+    WANT=$TARGET
+elif [ "$(cat $IG_CONN/status)" = connected ]; then
+    WANT=dgpu
+else
+    WANT=igpu
+fi
+
+if [ "$WANT" = dgpu ]; then
+    FROM_CONN=$IG_CONN; FROM_CARD=$IG_CARD
+    TO_CONN=$NV_CONN;   TO_CARD=$NV_CARD
+    CMD=dgpu; [ "$PREOPS" = nopreops ] && CMD=sw-dgpu
+else
+    FROM_CONN=$NV_CONN; FROM_CARD=$NV_CARD
+    TO_CONN=$IG_CONN;   TO_CARD=$IG_CARD
+    CMD=igpu; [ "$PREOPS" = nopreops ] && CMD=sw-igpu
+fi
+
+log "=== live-switch -> $WANT  cmd=$CMD  $(date -Is) ==="
+log "before: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status)"
+
+KWIN_PID_BEFORE=$(pgrep -x kwin_wayland | head -1)
+log "kwin pid before: ${KWIN_PID_BEFORE:-none}"
+N=$(dmesg | wc -l)
+
+# --- brightness match ------------------------------------------------------
+# RUN_PRE_DISP_MUX_OPERATIONS takes iGpuBrightness precisely to avoid the jump
+# ("used to match brightness after switching mux to dGPU", ctrl0073dfp.h). In
+# nopreops mode never calls it, and in the default mode it reports
+# preOpsLatencyMs=0, so the backlight is matched here either way. Without this the panel jumps to full: the two backlights are
+# independent devices - intel_backlight max=400, nvidia_0 max=100 - so always
+# convert via percent rather than copying the raw value.
+bl_get_pct() {
+    [ -r "$1/brightness" ] || { echo ""; return; }
+    m=$(cat "$1/max_brightness" 2>/dev/null)
+    c=$(cat "$1/brightness" 2>/dev/null)
+    [ -n "$m" ] && [ "$m" -gt 0 ] 2>/dev/null || { echo ""; return; }
+    echo $(( c * 100 / m ))
+}
+bl_set_pct() {
+    [ -w "$1/brightness" ] || return 1
+    m=$(cat "$1/max_brightness" 2>/dev/null)
+    [ -n "$m" ] && [ "$m" -gt 0 ] 2>/dev/null || return 1
+    v=$(( $2 * m / 100 ))
+    [ "$v" -lt 1 ] && v=1
+    echo "$v" > "$1/brightness" 2>/dev/null
+}
+
+# --- 1. load the module while the panel is STILL LIT -----------------------
+# Module init costs ~2.7s (measured: rm_ops -> hClient in dmesg), almost all of
+# it inside the NVIDIA RM. Doing it before the panel is released keeps that time
+# out of the dark window entirely. Nothing here touches the display.
+rmmod nvmuxk 2>/dev/null
+if ! insmod "$DIR/nvmuxk.ko"; then
+    log "insmod FAILED - panel untouched, aborting"
+    log "=== aborted $(date -Is) ==="
+    exit 1
+fi
+log "nvmuxk loaded (panel still lit)"
+
+# ======================= DARK WINDOW STARTS HERE ==========================
+T0=$(date +%s.%N)
+
+# --- 2. make the current owner release the panel ---------------------------
+echo off > $FROM_CONN/status 2>/dev/null
+udevadm trigger --action=change "$FROM_CARD" 2>/dev/null
+udevadm settle --timeout=3 2>/dev/null
+sleep 0.4
+
+# --- 3. move the mux, immediately ------------------------------------------
+echo "$CMD" > /proc/nvmuxk 2>/dev/null
+
+# --- 4. hand the panel to the new owner ------------------------------------
+# Probe fast first, then back off. A single check is unreliable, but the common
+# case connects on the first probe, so short early waits keep the dark window
+# near the ~100ms the mux itself takes.
+i=0
+while [ $i -lt 10 ]; do
+    echo detect > $TO_CONN/status 2>/dev/null
+    udevadm trigger --action=change "$TO_CARD" 2>/dev/null
+    udevadm settle --timeout=2 2>/dev/null
+    [ "$(cat $TO_CONN/status)" = connected ] && break
+    i=$((i+1))
+    [ $i -le 3 ] && sleep 0.3 || sleep 1.5
+    [ "$(cat $TO_CONN/status)" = connected ] && break
+    log "  probe $i: $(basename $TO_CONN)=$(cat $TO_CONN/status)"
+done
+
+T1=$(date +%s.%N)
+# ======================== DARK WINDOW ENDS HERE ===========================
+log "dark window: $(awk -v a=$T0 -v b=$T1 'BEGIN{printf "%.2f", b-a}')s"
+log "after switch: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status) edid=$(wc -c < $TO_CONN/edid 2>/dev/null)B"
+
+dmesg | tail -n +$((N+1)) | grep -iE "nvmuxk|NVRM" | tail -16 >> "$LOGF"; sync
+rmmod nvmuxk 2>/dev/null
+
+# --- 5. brightness, now that the new owner drives the panel ----------------
+if [ "$WANT" = dgpu ]; then SRC_BL=$IBL; DST_BL=$NBL; else SRC_BL=$NBL; DST_BL=$IBL; fi
+PCT=$(bl_get_pct "$SRC_BL")
+if [ -n "$PCT" ]; then
+    if bl_set_pct "$DST_BL" "$PCT"; then
+        log "brightness matched: ${PCT}% -> $(basename $DST_BL) ($(cat $DST_BL/brightness)/$(cat $DST_BL/max_brightness))"
+    else
+        log "brightness: could not write $(basename $DST_BL) (continuing)"
+    fi
+else
+    log "brightness: could not read $(basename $SRC_BL) (continuing)"
+fi
+
+# --- 6. verify, revert if the panel did not come back ----------------------
+KWIN_PID_AFTER=$(pgrep -x kwin_wayland | head -1)
+if [ "$(cat $TO_CONN/status)" = connected ]; then
+    log "OK: panel is on $WANT ($(basename $TO_CONN) connected)"
+    if [ "$KWIN_PID_BEFORE" = "$KWIN_PID_AFTER" ]; then
+        log "SESSION PRESERVED: kwin pid unchanged ($KWIN_PID_AFTER)"
+    else
+        log "NOTE: kwin restarted (${KWIN_PID_BEFORE:-none} -> ${KWIN_PID_AFTER:-none}) - panel moved but session was lost"
+    fi
+else
+    log "FAILED: $(basename $TO_CONN) is $(cat $TO_CONN/status) - reverting"
+    rmmod nvmuxk 2>/dev/null
+    if insmod "$DIR/nvmuxk.ko" 2>/dev/null; then
+        # Full sequence, not sw-*: RUN_PRE/RUN_POST are what bring the connector
+        # up, so the recovery path must use them too or it can leave the panel
+        # dark.
+        [ "$WANT" = dgpu ] && echo igpu > /proc/nvmuxk 2>/dev/null \
+                           || echo dgpu > /proc/nvmuxk 2>/dev/null
+        sleep 1
+        rmmod nvmuxk 2>/dev/null
+    fi
+    # clear every forced status so the kernel probes for real again
+    echo detect > $IG_CONN/status 2>/dev/null
+    echo detect > $NV_CONN/status 2>/dev/null
+    udevadm trigger --action=change "$IG_CARD" 2>/dev/null
+    udevadm trigger --action=change "$NV_CARD" 2>/dev/null
+    sleep 2
+    log "reverted: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status)"
+    if [ "$(cat $IG_CONN/status)" != connected ] && [ "$(cat $NV_CONN/status)" != connected ]; then
+        log "PANEL STILL DARK - falling back to a Plasma restart on the iGPU"
+        sh "$BINDIR/mux-to-igpu" >/dev/null 2>&1
+    fi
+fi
+
+log "=== done $(date -Is) ==="

@@ -1,0 +1,11 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+!nvidia.symvers
+*.order
+.*.cmd
+.tmp_versions/
+*.log

@@ -1,0 +1,89 @@
+#!/bin/sh
+# Move the internal panel to the NVIDIA dGPU and restart Plasma on it.
+#
+# MUST detach: this stops plasmalogin, which kills the terminal it was
+# launched from. Without setsid the script dies mid-switch.
+# --- portable paths (bundle) ----------------------------------------------
+# Resolve everything relative to this script so it works wherever it is
+# unpacked. $0 is not
+# reliable after the setsid re-exec, so the absolute path is resolved once here
+# and passed through the environment as MUX_SELF.
+if [ -z "${MUX_SELF:-}" ]; then
+    MUX_SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")"
+fi
+BINDIR=$(dirname -- "$MUX_SELF")
+ROOTDIR=$(CDPATH= cd -- "$BINDIR/.." && pwd)
+DIR="$ROOTDIR/kernel"
+# Fall back to an installed module if this is not a source checkout.
+[ -f "$DIR/nvmuxk.ko" ] || DIR="/lib/modules/$(uname -r)/updates"
+LOGDIR="${MUX_LOG_DIR:-/var/log/predator-mux}"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=/tmp
+LCD='\_SB.PC00.RP09.PXSX.LCD0'
+C0=/sys/class/drm/card0-eDP-2
+C1=/sys/class/drm/card1-eDP-1
+[ "$(id -u)" = 0 ] || { echo "need root: sudo sh $0"; exit 1; }
+
+if [ "${CHILD:-0}" != 1 ]; then
+    LOGF="$LOGDIR/to-dgpu-$(date +%Y%m%d-%H%M%S).log"
+    echo "switching to the RTX 5070. Plasma restarts on it (~15s)."
+    echo "log: $LOGF"
+    CHILD=1 LOGF="$LOGF" MUX_SELF="$MUX_SELF" setsid nohup sh "$MUX_SELF" >/dev/null 2>&1 </dev/null &
+    sleep 1; exit 0
+fi
+
+log() { echo "$@" >> "$LOGF"; sync; }
+state() { printf '%s' "$LCD.MXDS 0x0" > /proc/acpi/call 2>/dev/null; tr -d '\000' < /proc/acpi/call; }
+
+log "=== to-dgpu $(date -Is) ==="
+log "before: MXDS=$(state) eDP-1=$(cat $C1/status) eDP-2=$(cat $C0/status)"
+N=$(dmesg | wc -l)
+
+systemctl stop plasmalogin; sleep 3
+echo off > $C1/status; sleep 2
+log "i915 released: eDP-1=$(cat $C1/status)"
+
+rmmod nvmuxk 2>/dev/null
+if ! insmod "$DIR/nvmuxk.ko"; then
+    log "insmod FAILED"; echo detect > $C1/status; systemctl start plasmalogin; exit 1
+fi
+echo dgpu > /proc/nvmuxk 2>/dev/null
+sleep 2
+log "after switch: MXDS=$(state) eDP-2=$(cat $C0/status) edid=$(wc -c < $C0/edid)B act=$(nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null|head -1)"
+dmesg | tail -n +$((N+1)) | grep -iE "nvmuxk|NVRM" | tail -12 >> "$LOGF"; sync
+rmmod nvmuxk 2>/dev/null
+
+# Make the NVIDIA GPU KWin's PRIMARY, so the desktop is rendered AND scanned out
+# on the 5070 with no cross-GPU copy. Rendering follows the primary and nothing
+# else: kwin v6.7.4 src/backends/drm/drm_egl_backend.cpp:48
+#     setRenderDevice(m_backend->primaryGpu()->renderDevice());
+# and any output on a different GPU gets a MultiGpuSwapchain copy
+# (drm_egl_layer_surface.cpp:479). primaryGpu() is m_gpus.front(), fixed at init.
+#
+# KWIN_DRM_DEVICES sets that order directly and makes the heuristic sort be
+# skipped outright (drm_backend.cpp:136 `if (m_explicitGpus.empty() && ...)`),
+# so card0 (NVIDIA) becomes primary deterministically.
+#
+# Deliberately NOT KWIN_RENDER_NODES: that one is an EXCLUSIVE render-device
+# whitelist (gpumanager.cpp scanForRenderDevices() returns early, never
+# enumerating via udev), which would strip the Intel render device entirely and
+# leave KWin with nothing if the panel is ever back on the iGPU.
+# KWIN_DRM_DEVICES keeps BOTH devices open, so live-switch.sh still works after.
+mkdir -p /etc/systemd/system/plasmalogin.service.d
+printf '[Service]\nEnvironment=KWIN_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1\n' \
+    > /etc/systemd/system/plasmalogin.service.d/99-nvmux.conf
+systemctl daemon-reload
+log "KWIN_DRM_DEVICES=card0:card1 -> NVIDIA is KWin's primary (render + scanout)"
+
+systemctl start plasmalogin
+log "plasma starting on dGPU..."
+
+# safety net seq3 lacked: if Plasma does not come up on the dGPU, go back
+# automatically instead of leaving a black screen.
+sleep 25
+if [ "$(systemctl is-active plasmalogin)" = active ] && [ "$(cat $C0/status)" = connected ]; then
+    log "OK: plasmalogin active, panel on dGPU. Staying."
+else
+    log "FAILED (plasmalogin=$(systemctl is-active plasmalogin) eDP-2=$(cat $C0/status)) - reverting"
+    sh "$BINDIR/mux-to-igpu" >/dev/null 2>&1
+fi
+log "=== done $(date -Is) ==="
