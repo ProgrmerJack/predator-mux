@@ -133,12 +133,22 @@ poor-man's alternative to the WDDM driver's
 
 ## Limitations
 
-- **A live switch moves scanout, not rendering.** KWin binds its render device
-  to `primaryGpu()->renderDevice()` at backend construction
+- **A live switch does not move the compositor's own rendering.** KWin binds
+  its render device to `primaryGpu()->renderDevice()` at backend construction
   (`drm_egl_backend.cpp`), and `primaryGpu()` is `m_gpus.front()`, fixed at
-  init. Outputs on any other GPU get a `MultiGpuSwapchain` copy. The
-  restart-based scripts avoid this by making the dGPU primary through
-  `KWIN_DRM_DEVICES`. Plasma 6.8 removes the copy (KWin MR !7101, dma-buf v6).
+  init, so desktop compositing keeps happening on whichever GPU was primary at
+  startup and is copied to the output via `MultiGpuSwapchain`.
+
+  This does **not** apply to applications. A fullscreen client whose buffer is
+  already on the output's GPU is scanned out directly, because
+  `EglGbmLayer::importScanoutBuffer()` only rejects buffers whose device differs
+  from the output's GPU. So with the panel muxed to the dGPU, a fullscreen game
+  rendering on the dGPU goes straight to the panel with no iGPU involvement and
+  no copy. The compositor is bypassed entirely for that surface.
+
+  If you want desktop compositing on the dGPU too, the restart-based scripts
+  make it primary through `KWIN_DRM_DEVICES`. Plasma 6.8 removes the copy cost
+  for the remaining cases (KWin MR !7101, dma-buf v6).
 - **The panel blanks for roughly a second.** A glitch-free handoff needs the
   panel held in PSR across the switch. i915 tears PSR down on the CRTC-disable
   path (`intel_psr_disable()`), and `intel_psr_pause()` calls `intel_psr_exit()`.
