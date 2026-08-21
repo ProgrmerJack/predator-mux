@@ -1,0 +1,20 @@
+pkgbase = predator-mux-dkms
+	pkgdesc = Runtime display-MUX switching for NVIDIA Advanced Optimus laptops, without restarting the session
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/ProgrmerJack/predator-mux
+	install = predator-mux-dkms.install
+	arch = x86_64
+	license = MIT
+	depends = dkms
+	depends = systemd
+	depends = kmod
+	optdepends = nvidia-open-dkms: provides the exported nvidia_get_rm_ops nvmuxk needs
+	optdepends = nvidia-open: same, prebuilt for the stock kernel
+	optdepends = acpi_call-dkms: lets mux-preflight report which mux chip is fitted
+	provides = predator-mux
+	conflicts = predator-mux
+	source = predator-mux-dkms-0.1.0.tar.gz::https://github.com/ProgrmerJack/predator-mux/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 8ba4f7408415c4c586951140cf786740493cd15df0a732d201e102e352569939
+
+pkgname = predator-mux-dkms

@@ -19,7 +19,7 @@ provides=('predator-mux')
 conflicts=('predator-mux')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8ba4f7408415c4c586951140cf786740493cd15df0a732d201e102e352569939')
 
 package() {
   cd "predator-mux-${pkgver}"
