@@ -16,9 +16,46 @@ DIR="$ROOTDIR/kernel"
 [ -f "$DIR/nvmuxk.ko" ] || DIR="/lib/modules/$(uname -r)/updates"
 LOGDIR="${MUX_LOG_DIR:-/var/log/predator-mux}"
 mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=/tmp
-LCD='\_SB.PC00.RP09.PXSX.LCD0'
-C0=/sys/class/drm/card0-eDP-2
-C1=/sys/class/drm/card1-eDP-1
+# --- discover this machine ------------------------------------------------
+# See mux-switch for why none of this is a fixed path.
+NV_CARD=""; IG_CARD=""
+for card in /sys/class/drm/card[0-9] /sys/class/drm/card[0-9][0-9]; do
+    [ -e "$card/device/vendor" ] || continue
+    case "$(cat "$card/device/vendor" 2>/dev/null)" in
+        0x10de) [ -n "$NV_CARD" ] || NV_CARD=$card ;;
+        0x8086|0x1002) [ -n "$IG_CARD" ] || IG_CARD=$card ;;
+    esac
+done
+[ -n "$NV_CARD" ] && [ -n "$IG_CARD" ] || {
+    echo "need an NVIDIA GPU and an Intel or AMD iGPU; run mux-preflight" >&2; exit 1; }
+C0=""; C1=""
+for c in "$NV_CARD"-eDP-*; do [ -e "$c/status" ] && C0=$c && break; done
+for c in "$IG_CARD"-eDP-*; do [ -e "$c/status" ] && C1=$c && break; done
+[ -n "$C0" ] && [ -n "$C1" ] || {
+    echo "the panel is not wired to both GPUs; run mux-preflight" >&2; exit 1; }
+# MXDS is read for the log only. The ACPI node is the dGPU's own, and the panel
+# is the display child that carries a bit-31 _ADR.
+LCD=""
+NV_ACPI=$(cat "$NV_CARD/device/firmware_node/path" 2>/dev/null)
+if [ -n "$NV_ACPI" ]; then
+    for d in /sys/bus/acpi/devices/*/; do
+        dp=$(cat "$d/path" 2>/dev/null) || continue
+        case "$dp" in "$NV_ACPI".*) ;; *) continue ;; esac
+        a=$(printf '%d' "$(cat "$d/adr" 2>/dev/null)" 2>/dev/null) || continue
+        [ $((a / 2147483648)) -eq 1 ] 2>/dev/null && { LCD=$dp; break; }
+    done
+fi
+# INIT_MUX_DATA needs this panel's EDID ids; see mux-switch.
+edid_ids() {
+    for c in "$C1" "$C0"; do
+        [ -r "$c/edid" ] || continue
+        [ "$(wc -c < "$c/edid" 2>/dev/null)" -gt 11 ] 2>/dev/null || continue
+        od -An -tx1 -j8 -N4 "$c/edid" 2>/dev/null | awk 'NF==4{
+            printf "manfid=0x%s%s productid=0x%s%s", $2, $1, $4, $3 }'
+        return
+    done
+}
+MODARGS=$(edid_ids)
 [ "$(id -u)" = 0 ] || { echo "need root: sudo sh $0"; exit 1; }
 
 if [ "${CHILD:-0}" != 1 ]; then
@@ -30,16 +67,17 @@ if [ "${CHILD:-0}" != 1 ]; then
 fi
 
 log() { echo "$@" >> "$LOGF"; sync; }
-state() { printf '%s' "$LCD.MXDS 0x0" > /proc/acpi/call 2>/dev/null; tr -d '\000' < /proc/acpi/call; }
+state() { [ -n "$LCD" ] && [ -w /proc/acpi/call ] || { echo n/a; return; }
+          printf '%s' "$LCD.MXDS 0x0" > /proc/acpi/call 2>/dev/null; tr -d '\000' < /proc/acpi/call; }
 
 log "=== to-igpu $(date -Is) ==="
-log "before: MXDS=$(state) eDP-1=$(cat $C1/status) eDP-2=$(cat $C0/status)"
+log "before: MXDS=$(state) $(basename $C1)=$(cat $C1/status) $(basename $C0)=$(cat $C0/status)"
 N=$(dmesg | wc -l)
 
 systemctl stop plasmalogin; sleep 3
 
 rmmod nvmuxk 2>/dev/null
-if insmod "$DIR/nvmuxk.ko" 2>/dev/null; then
+if insmod "$DIR/nvmuxk.ko" $MODARGS 2>/dev/null; then
     echo igpu > /proc/nvmuxk 2>/dev/null
     sleep 2
     dmesg | tail -n +$((N+1)) | grep -iE "nvmuxk|NVRM" | tail -12 >> "$LOGF"; sync
@@ -52,7 +90,7 @@ printf '%s' "$LCD.MXDS 0x01" > /proc/acpi/call 2>/dev/null   # ACPI fallback
 echo detect > $C1/status 2>/dev/null
 echo detect > $C0/status 2>/dev/null
 sleep 2
-log "after: MXDS=$(state) eDP-1=$(cat $C1/status) eDP-2=$(cat $C0/status)"
+log "after: MXDS=$(state) $(basename $C1)=$(cat $C1/status) $(basename $C0)=$(cat $C0/status)"
 
 # drop the NVIDIA-primary override before going back to Intel
 rm -f /etc/systemd/system/plasmalogin.service.d/99-nvmux.conf

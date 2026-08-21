@@ -1,0 +1,27 @@
+[Unit]
+Description=Move the internal panel to the %i GPU
+Documentation=https://github.com/ProgrmerJack/predator-mux
+ConditionPathExists=/usr/local/lib/predator-mux/bin/mux-switch
+
+[Service]
+Type=oneshot
+# ASense's control daemon runs under ProtectKernelModules=true with only
+# CAP_SYS_ADMIN, so insmod inside it returns EPERM and the helper aborts at its
+# first step. The switch is delegated here instead of loosening that sandbox:
+# this unit is the only privileged surface, it accepts exactly two instance
+# names, and the always-running daemon keeps every one of its restrictions.
+#
+# CHILD=1 runs the helper inline rather than through its own setsid detach.
+# A detached child would be outside the ExecStart process, so systemd would
+# reap it with the cgroup the moment this oneshot returned - mid-switch, with
+# the panel owned by neither GPU.
+ExecStart=/bin/sh -c '\
+case "$1" in igpu|dgpu) ;; *) echo "target must be igpu or dgpu" >&2; exit 2 ;; esac; \
+self=/usr/local/lib/predator-mux/bin/mux-switch; \
+mkdir -p /var/log/predator-mux; \
+exec env CHILD=1 TARGET="$1" MUX_SELF="$self" \
+     LOGF="/var/log/predator-mux/live-$(date +%%Y%%m%%d-%%H%%M%%S).log" "$self"' \
+  predator-mux-switch %i
+# Worst case is probe loop, failed switch, revert, then a compositor restart.
+# Never let systemd SIGTERM the helper in the middle of that.
+TimeoutStartSec=300

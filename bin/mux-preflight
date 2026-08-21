@@ -59,12 +59,13 @@ for card in /sys/class/drm/card[0-9]; do
     [ -e "$card/device/vendor" ] || continue
     v=$(cat "$card/device/vendor" 2>/dev/null)
     case "$v" in
-        0x8086) IG_CARD=$card ;;
+        0x8086) IG_CARD=$card; IG_VENDOR=Intel ;;
+        0x1002) IG_CARD=$card; IG_VENDOR=AMD ;;
         0x10de) NV_CARD=$card ;;
     esac
 done
-[ -n "$IG_CARD" ] && ok "Intel GPU  : $(basename "$IG_CARD") ($(basename "$(readlink -f "$IG_CARD/device")"))" \
-                  || bad "no Intel iGPU found"
+[ -n "$IG_CARD" ] && ok "$IG_VENDOR iGPU : $(basename "$IG_CARD") ($(basename "$(readlink -f "$IG_CARD/device")"))" \
+                  || bad "no Intel or AMD iGPU found"
 [ -n "$NV_CARD" ] && ok "NVIDIA GPU : $(basename "$NV_CARD") ($(basename "$(readlink -f "$NV_CARD/device")"))" \
                   || bad "no NVIDIA dGPU found"
 
@@ -108,22 +109,64 @@ else
     bad "no readable EDID on either eDP connector (the panel must be attached to one GPU)"
 fi
 
-# Compare against what nvmuxk.c will actually send. A mismatch means the
-# compiled-in defaults are for a different panel - refuse rather than let a
-# wrong INIT_MUX_DATA wedge GSP.
-SRC_MANF=$(sed -n 's/^static uint manfid = \(0x[0-9A-Fa-f]*\);.*/\1/p' "$DIR/kernel/nvmuxk.c" | head -1)
-SRC_PROD=$(sed -n 's/^static uint productid = \(0x[0-9A-Fa-f]*\);.*/\1/p' "$DIR/kernel/nvmuxk.c" | head -1)
-if [ -n "$DETECTED_MANF" ] && [ -n "$SRC_MANF" ]; then
-    dm=$(printf '%d' "$DETECTED_MANF" 2>/dev/null); sm=$(printf '%d' "$SRC_MANF" 2>/dev/null)
-    dp=$(printf '%d' "$DETECTED_PROD" 2>/dev/null); sp=$(printf '%d' "$SRC_PROD" 2>/dev/null)
-    if [ "$dm" = "$sm" ] && [ "$dp" = "$sp" ]; then
-        ok "module defaults match this panel"
+# nvmuxk carries no panel defaults: manfid/productid are 0 unless passed, and
+# the module refuses INIT_MUX_DATA rather than send ids that are not this
+# panel's. mux-switch reads them off the connector exactly as above and passes
+# them on insmod, so all that is checked here is that they are readable.
+SRC_MANF=$(sed -n 's/^static uint manfid;.*/0/p' "$DIR/kernel/nvmuxk.c" | head -1)
+if [ -n "$DETECTED_MANF" ]; then
+    if [ -n "$SRC_MANF" ]; then
+        ok "module takes the panel ids from the connector (no compiled-in panel)"
     else
-        bad "module defaults are for a DIFFERENT panel (module: $SRC_MANF/$SRC_PROD, this panel: $DETECTED_MANF/$DETECTED_PROD)"
-        say "        Load the module with the right values instead of the defaults:"
-        say "          insmod nvmuxk.ko manfid=$DETECTED_MANF productid=$DETECTED_PROD"
-        say "        A wrong INIT_MUX_DATA wedges GSP until reboot - do not skip this."
+        warn "this module still has compiled-in panel ids; check they are $DETECTED_MANF/$DETECTED_PROD"
     fi
+fi
+
+# --- ACPI id --------------------------------------------------------------
+# RM's acpiId <-> displayId map. NVKMS hardcodes a one-entry table for a single
+# machine; nvmuxk derives this from the GPU's own ACPI namespace at load time.
+# The same value is visible from sysfs, so it can be checked without loading
+# anything: bit 31 marks an id that follows the ACPI display-device layout.
+say
+say "[4b] ACPI panel id"
+NV_ACPI=$(cat "$NV_CARD/device/firmware_node/path" 2>/dev/null)
+ACPI_ID=""
+if [ -n "$NV_ACPI" ]; then
+    say "      dGPU ACPI node: $NV_ACPI"
+    for d in /sys/bus/acpi/devices/*/; do
+        dp=$(cat "$d/path" 2>/dev/null) || continue
+        case "$dp" in
+            "$NV_ACPI".*) ;;
+            *) continue ;;
+        esac
+        a=$(cat "$d/adr" 2>/dev/null) || continue
+        av=$(printf '%d' "$a" 2>/dev/null) || continue
+        # bit 31 set = a real display-device id, not a small child index
+        if [ "$av" -lt 0 ] 2>/dev/null || [ $((av / 2147483648)) -eq 1 ] 2>/dev/null; then
+            ACPI_ID=$a; say "      $dp _ADR=$a"; break
+        fi
+    done
+fi
+if [ -n "$ACPI_ID" ]; then
+    ok "panel ACPI id $ACPI_ID (nvmuxk derives this itself; no override needed)"
+    # Optional extra: MXID is NVIDIA's mux-identification method and returns a
+    # code the firmware maps to a mux part number. Only read if acpi_call is
+    # already loaded - it is a diagnostic, not a requirement, and preflight
+    # does not load kernel modules.
+    if [ -w /proc/acpi/call ]; then
+        for m in "$NV_ACPI.LCD0.MXID" "$NV_ACPI.MXID"; do
+            printf '%s 0x0' "$m" > /proc/acpi/call 2>/dev/null || continue
+            mx=$(tr -d '\000' < /proc/acpi/call 2>/dev/null)
+            case "$mx" in
+                0x*) [ "$mx" = "0x0" ] || say "      mux id $mx (from $m)"; break ;;
+            esac
+        done
+    fi
+else
+    warn "no ACPI display id under the dGPU - nvmuxk will skip SET_ACPI_ID_MAPPING"
+    say "      That may still work. If the switch fails, find the id with:"
+    say "        sudo modprobe acpi_call; echo '$NV_ACPI._DOD' | sudo tee /proc/acpi/call"
+    say "      and pass it as: insmod nvmuxk.ko acpiid=0x..."
 fi
 
 # --- 5. NVIDIA driver -----------------------------------------------------

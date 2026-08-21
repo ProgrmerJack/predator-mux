@@ -17,8 +17,8 @@
 #
 # Why this works, all verified in source at the installed versions:
 #
-#  1. KWin already has BOTH DRM devices open (/proc/<kwin>/fd shows card0,
-#     card1, renderD128, renderD129), so a connector moving between them is a
+#  1. KWin already has BOTH DRM devices open (/proc/<kwin>/fd shows both card
+#     nodes and both render nodes), so a connector moving between them is a
 #     hotplug on a device it already manages - not a new-device problem.
 #
 #  2. KWin survives having zero outputs. kwin v6.7.4 src/workspace.cpp:1374
@@ -46,7 +46,9 @@
 #         removed! Quitting..."; QCoreApplication::exit(1); }
 # This script only ever sends "change", never "remove", and never unbinds.
 #
-# card0 = NVIDIA 0000:01:00.0 (eDP-2), card1 = Intel 0000:00:02.0 (eDP-1).
+# Which card is which is discovered below, not assumed: on the development
+# machine card0 is the NVIDIA GPU and card1 the Intel one, which is the reverse
+# of what the numbering suggests.
 
 # --- portable paths (bundle) ----------------------------------------------
 # Resolve everything relative to this script so it works wherever it is
@@ -63,12 +65,54 @@ DIR="$ROOTDIR/kernel"
 [ -f "$DIR/nvmuxk.ko" ] || DIR="/lib/modules/$(uname -r)/updates"
 LOGDIR="${MUX_LOG_DIR:-/var/log/predator-mux}"
 mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=/tmp
-NV_CARD=/sys/class/drm/card0
-IG_CARD=/sys/class/drm/card1
-NV_CONN=$NV_CARD-eDP-2
-IG_CONN=$IG_CARD-eDP-1
-IBL=/sys/class/backlight/intel_backlight
-NBL=/sys/class/backlight/nvidia_0
+
+# --- discover this machine ------------------------------------------------
+# Nothing below is a fixed path. DRM card numbering is assignment order, not
+# identity: it changes with driver load order, and a USB display adapter is
+# enough to renumber both. The panel is whichever eDP connector each GPU
+# exposes, and the two backlights are separate devices with different scales.
+NV_CARD=""; IG_CARD=""
+for card in /sys/class/drm/card[0-9] /sys/class/drm/card[0-9][0-9]; do
+    [ -e "$card/device/vendor" ] || continue
+    case "$(cat "$card/device/vendor" 2>/dev/null)" in
+        0x10de) [ -n "$NV_CARD" ] || NV_CARD=$card ;;
+        0x8086|0x1002) [ -n "$IG_CARD" ] || IG_CARD=$card ;;
+    esac
+done
+[ -n "$NV_CARD" ] && [ -n "$IG_CARD" ] || {
+    echo "need an NVIDIA GPU and an Intel or AMD iGPU; run mux-preflight" >&2; exit 1; }
+
+NV_CONN=""; IG_CONN=""
+for c in "$NV_CARD"-eDP-*; do [ -e "$c/status" ] && NV_CONN=$c && break; done
+for c in "$IG_CARD"-eDP-*; do [ -e "$c/status" ] && IG_CONN=$c && break; done
+[ -n "$NV_CONN" ] && [ -n "$IG_CONN" ] || {
+    echo "the panel is not wired to both GPUs; run mux-preflight" >&2; exit 1; }
+
+# The dGPU backlight only exists while the dGPU drives the panel, so it is
+# resolved by prefix rather than required up front.
+NBL=""; IBL=""
+for b in /sys/class/backlight/*; do
+    case "$(basename "$b")" in
+        nvidia_*)                 [ -n "$NBL" ] || NBL=$b ;;
+        intel_backlight|amdgpu_bl*|acpi_video*)
+                                  [ -n "$IBL" ] || IBL=$b ;;
+    esac
+done
+
+# INIT_MUX_DATA needs this panel's own EDID ids and wedges GSP's mux state
+# until reboot if they are wrong, so they are read here and passed to the
+# module rather than compiled into it. Bytes 8..11, native-endian u16 pairs,
+# exactly as nvt_edid.c reads them.
+edid_ids() {
+    for c in "$IG_CONN" "$NV_CONN"; do
+        [ -r "$c/edid" ] || continue
+        [ "$(wc -c < "$c/edid" 2>/dev/null)" -gt 11 ] 2>/dev/null || continue
+        od -An -tx1 -j8 -N4 "$c/edid" 2>/dev/null | awk '''NF==4{
+            printf "manfid=0x%s%s productid=0x%s%s", $2, $1, $4, $3 }'''
+        return
+    done
+}
+MODARGS=$(edid_ids)
 
 [ "$(id -u)" = 0 ] || { echo "need root: sudo sh $0 $*"; exit 1; }
 
@@ -104,7 +148,9 @@ else
 fi
 
 log "=== live-switch -> $WANT  cmd=$CMD  $(date -Is) ==="
-log "before: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status)"
+log "cards: igpu=$(basename $IG_CARD) dgpu=$(basename $NV_CARD)  panel: $(basename $IG_CONN) + $(basename $NV_CONN)"
+log "modargs: ${MODARGS:-none}"
+log "before: $(basename $IG_CONN)=$(cat $IG_CONN/status) $(basename $NV_CONN)=$(cat $NV_CONN/status)"
 
 KWIN_PID_BEFORE=$(pgrep -x kwin_wayland | head -1)
 log "kwin pid before: ${KWIN_PID_BEFORE:-none}"
@@ -138,7 +184,7 @@ bl_set_pct() {
 # it inside the NVIDIA RM. Doing it before the panel is released keeps that time
 # out of the dark window entirely. Nothing here touches the display.
 rmmod nvmuxk 2>/dev/null
-if ! insmod "$DIR/nvmuxk.ko"; then
+if ! insmod "$DIR/nvmuxk.ko" $MODARGS; then
     log "insmod FAILED - panel untouched, aborting"
     log "=== aborted $(date -Is) ==="
     exit 1
@@ -176,7 +222,7 @@ done
 T1=$(date +%s.%N)
 # ======================== DARK WINDOW ENDS HERE ===========================
 log "dark window: $(awk -v a=$T0 -v b=$T1 'BEGIN{printf "%.2f", b-a}')s"
-log "after switch: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status) edid=$(wc -c < $TO_CONN/edid 2>/dev/null)B"
+log "after switch: $(basename $IG_CONN)=$(cat $IG_CONN/status) $(basename $NV_CONN)=$(cat $NV_CONN/status) edid=$(wc -c < $TO_CONN/edid 2>/dev/null)B"
 
 dmesg | tail -n +$((N+1)) | grep -iE "nvmuxk|NVRM" | tail -16 >> "$LOGF"; sync
 rmmod nvmuxk 2>/dev/null
@@ -206,7 +252,7 @@ if [ "$(cat $TO_CONN/status)" = connected ]; then
 else
     log "FAILED: $(basename $TO_CONN) is $(cat $TO_CONN/status) - reverting"
     rmmod nvmuxk 2>/dev/null
-    if insmod "$DIR/nvmuxk.ko" 2>/dev/null; then
+    if insmod "$DIR/nvmuxk.ko" $MODARGS 2>/dev/null; then
         # Full sequence, not sw-*: RUN_PRE/RUN_POST are what bring the connector
         # up, so the recovery path must use them too or it can leave the panel
         # dark.
@@ -221,7 +267,7 @@ else
     udevadm trigger --action=change "$IG_CARD" 2>/dev/null
     udevadm trigger --action=change "$NV_CARD" 2>/dev/null
     sleep 2
-    log "reverted: eDP-1=$(cat $IG_CONN/status) eDP-2=$(cat $NV_CONN/status)"
+    log "reverted: $(basename $IG_CONN)=$(cat $IG_CONN/status) $(basename $NV_CONN)=$(cat $NV_CONN/status)"
     if [ "$(cat $IG_CONN/status)" != connected ] && [ "$(cat $NV_CONN/status)" != connected ]; then
         log "PANEL STILL DARK - falling back to a Plasma restart on the iGPU"
         sh "$BINDIR/mux-to-igpu" >/dev/null 2>&1

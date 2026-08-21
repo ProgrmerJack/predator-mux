@@ -28,6 +28,8 @@
 #include <linux/kernel.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
+#include <linux/pci.h>
+#include <linux/acpi.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -37,17 +39,27 @@ MODULE_DESCRIPTION("NVIDIA display-mux control at kernel RM privilege");
 
 /* EDID bytes 0x08..0x0B read as native u16, matching nvt_edid.c:
  *   pInfo->manuf_id = p->wIDManufName;  pInfo->product_id = p->wIDProductCode;
- * INIT_MUX_DATA fails without these (nvkms-rm.c MuxInit). */
-static uint manfid = 0x834C;      /* "SDC" */
-static uint productid = 0x41AB;
+ * INIT_MUX_DATA fails without these (nvkms-rm.c MuxInit), and a failed
+ * INIT_MUX_DATA wedges GSP's mux state until the next reboot - every later
+ * GET_DISP_MUX_STATUS returns NV_ERR_NOT_SUPPORTED, and unloading this module
+ * does not clear it. They are therefore not defaulted to any particular panel:
+ * a wrong id is worse than a missing one, so 0 refuses the call instead.
+ * mux-switch reads them off the panel and passes them on insmod. */
+static uint manfid;
+static uint productid;
 static uint tconid;               /* NVKMS leaves this 0 */
 static uint usequery = 1;         /* call QUERY_DISPLAY_IDS_WITH_MUX first */
 static uint brightness;           /* NVKMS leaves iGpuBrightness at 0 */
-/* LCD0._ADR / _DOD entry for the internal panel on this machine. NVKMS ships a
-   hardcoded table with one machine in it (acpiId 0x8001a420); ours differs.
+/* ACPI id of the internal panel, as RM's acpiId <-> displayId map wants it.
+   NVKMS ships a hardcoded table with one machine in it (acpiId 0x8001a420,
+   commented in nvkms-rm.c as "a poor-man's alternative to the WDDM driver's
+   CDisplayMgr::NVInitializeACPIToDeviceMaskMap()"). Ours differs, and so will
+   every other machine's, so it is derived at load time from the dGPU's own
+   ACPI namespace instead - see acpi_panel_id(). 0 means "derive it"; a non-zero
+   module parameter overrides the probe.
    RUN_PRE toggles LCD VDD / BL EN / PWM MUX, which are ACPI-side, so RM likely
-   needs this mapping to act on displayId 0x200. */
-static uint acpiid = 0x8000A450;
+   needs this mapping to act on the panel's displayId. */
+static uint acpiid;
 /* The skip bits NVKMS clobbers (see MUX_F_* below). Measured on this machine
    with 'probe-pre', twice, identical both times:
      RUN_PRE  sr=no  -> 0x56 NOT_SUPPORTED   (both directions)
@@ -60,6 +72,10 @@ static uint acpiid = 0x8000A450;
    discarding it. Default srskip=1: it is the only accepted combination. */
 static uint srskip = 1;           /* 1 = SR_ENTER_SKIP_YES / SR_EXIT_SKIP_YES */
 static uint blskip;               /* 1 = SKIP_BACKLIGHT_ENABLE_YES */
+/* Load anyway on a driver whose ABI this module was not read from. Off by
+   default: the failure mode is not a clean error but wrong bytes in a
+   KERNEL_PRIVILEGED control. */
+static uint force;
 module_param(manfid, uint, 0444);
 module_param(productid, uint, 0444);
 module_param(tconid, uint, 0444);
@@ -68,8 +84,19 @@ module_param(brightness, uint, 0644);
 module_param(acpiid, uint, 0444);
 module_param(srskip, uint, 0644);
 module_param(blskip, uint, 0644);
+module_param(force, uint, 0444);
+
+MODULE_PARM_DESC(acpiid, "ACPI id of the internal panel (0 = derive from the GPU's ACPI namespace)");
+MODULE_PARM_DESC(manfid, "panel EDID manufacturer id (0 = derive from the attached panel)");
+MODULE_PARM_DESC(productid, "panel EDID product id (0 = derive from the attached panel)");
+MODULE_PARM_DESC(force, "load even if the driver version does not match the ABI this was read from");
 
 #define PFX "nvmuxk: "
+
+/* The driver release every struct below was transcribed from. Checked against
+   the running driver at load; see rm_setup(). Update this only together with a
+   re-read of the headers listed at the top of this file. */
+#define NVMUXK_ABI_VERSION "610.57.04"
 
 typedef u32 NvU32; typedef s32 NvV32; typedef u32 NvHandle;
 typedef u8 NvU8;  typedef u8 NvBool; typedef u64 NvP64;
@@ -257,16 +284,121 @@ static void rm_free(NvHandle obj, NvHandle parent)
 	ops.op(sp, &c);
 }
 
+/* Derive the internal panel's ACPI id from the dGPU's own ACPI namespace.
+ *
+ * Two sources, in order of authority:
+ *
+ *   _DOD on the GPU's ACPI device is the list of display devices the firmware
+ *   says this adapter drives, and its entries are exactly the ids RM's map
+ *   wants. It is the same thing the WDDM driver walks. On some firmware it is
+ *   gated on the BIOS display-mode setting and returns an empty or zero-only
+ *   package, which is why there is a second source.
+ *
+ *   Failing that, each display child of the GPU carries the same value in its
+ *   own _ADR, unconditionally.
+ *
+ * Either way an id only counts if bit 31 is set: ACPI Appendix B reserves that
+ * bit for "this id conforms to the display-device layout", and the small
+ * indices firmware uses for non-display children would otherwise be accepted.
+ */
+#define ACPI_DISPLAY_ID_VALID 0x80000000u
+
+static NvU32 acpi_id_from_dod(acpi_handle handle)
+{
+	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *pkg;
+	NvU32 found = 0;
+	int i;
+
+	if (ACPI_FAILURE(acpi_evaluate_object(handle, "_DOD", NULL, &buf)))
+		return 0;
+
+	pkg = buf.pointer;
+	if (pkg && pkg->type == ACPI_TYPE_PACKAGE) {
+		for (i = 0; i < pkg->package.count && !found; i++) {
+			union acpi_object *e = &pkg->package.elements[i];
+			NvU32 id;
+
+			if (e->type != ACPI_TYPE_INTEGER)
+				continue;
+			id = (NvU32)e->integer.value;
+			if (id & ACPI_DISPLAY_ID_VALID)
+				found = id;
+		}
+	}
+	kfree(buf.pointer);
+	return found;
+}
+
+static NvU32 acpi_id_from_children(acpi_handle handle)
+{
+	acpi_handle child = NULL;
+	NvU32 found = 0;
+
+	while (!found &&
+	       ACPI_SUCCESS(acpi_get_next_object(ACPI_TYPE_DEVICE, handle,
+						 child, &child))) {
+		unsigned long long adr;
+
+		if (ACPI_FAILURE(acpi_evaluate_integer(child, "_ADR", NULL, &adr)))
+			continue;
+		if ((NvU32)adr & ACPI_DISPLAY_ID_VALID)
+			found = (NvU32)adr;
+	}
+	return found;
+}
+
+static NvU32 acpi_panel_id(const nv_gpu_info_t *gpu)
+{
+	struct pci_dev *pdev;
+	acpi_handle handle;
+	NvU32 id;
+
+	pdev = pci_get_domain_bus_and_slot(gpu->pci_info.domain,
+					   gpu->pci_info.bus,
+					   PCI_DEVFN(gpu->pci_info.slot,
+						     gpu->pci_info.function));
+	if (!pdev) {
+		pr_info(PFX "no pci_dev for %04x:%02x:%02x.%x\n",
+			gpu->pci_info.domain, gpu->pci_info.bus,
+			gpu->pci_info.slot, gpu->pci_info.function);
+		return 0;
+	}
+
+	handle = ACPI_HANDLE(&pdev->dev);
+	if (!handle) {
+		pr_info(PFX "GPU has no ACPI companion\n");
+		pci_dev_put(pdev);
+		return 0;
+	}
+
+	id = acpi_id_from_dod(handle);
+	if (id)
+		pr_info(PFX "acpiId 0x%08x from _DOD\n", id);
+	else if ((id = acpi_id_from_children(handle)))
+		pr_info(PFX "acpiId 0x%08x from a display child's _ADR\n", id);
+	else
+		pr_info(PFX "no ACPI display id on this GPU\n");
+
+	pci_dev_put(pdev);
+	return id;
+}
+
 static int rm_setup(void)
 {
 	nv_gpu_info_t *gi;
 	NV0080_ALLOC da; NV2080_ALLOC sa;
-	NvU32 n;
+	NvU32 n, pick, i;
 	int rc;
 
 	/* nvidia_get_rm_ops() rejects a version mismatch but writes the expected
 	   string back into the struct, so a second call with it matches exactly.
-	   This avoids hardcoding a driver version. */
+	   That makes the handshake itself version-independent - but only the
+	   handshake. Everything below hand-copies NVOS54_PARAMETERS and the
+	   NV0073_CTRL_* parameter structs out of one release's headers, and a
+	   layout change in a later driver would compile clean and send wrong
+	   bytes to a KERNEL_PRIVILEGED control. So the version the ABI was read
+	   from is checked here rather than assumed. */
 	ops.version_string = "";
 	rc = nvidia_get_rm_ops(&ops);
 	if (rc) {
@@ -276,15 +408,44 @@ static int rm_setup(void)
 	if (rc) { pr_err(PFX "nvidia_get_rm_ops failed 0x%x\n", rc); return -EINVAL; }
 	pr_info(PFX "rm_ops ok, version \"%s\"\n", ops.version_string);
 
+	if (strcmp(ops.version_string, NVMUXK_ABI_VERSION) != 0) {
+		if (!force) {
+			pr_err(PFX "driver is %s, this module's ABI was read from %s\n",
+			       ops.version_string, NVMUXK_ABI_VERSION);
+			pr_err(PFX "refusing: re-check the structs against your driver, then load with force=1\n");
+			return -EINVAL;
+		}
+		pr_warn(PFX "force=1: proceeding on %s with ABI from %s\n",
+			ops.version_string, NVMUXK_ABI_VERSION);
+	}
+
 	if (ops.alloc_stack(&sp)) { pr_err(PFX "alloc_stack failed\n"); return -ENOMEM; }
 
 	gi = kzalloc(sizeof(*gi) * 32, GFP_KERNEL);
 	if (!gi) { ops.free_stack(sp); return -ENOMEM; }
 	n = ops.enumerate_gpus(gi);
 	if (!n) { pr_err(PFX "no GPUs\n"); kfree(gi); ops.free_stack(sp); return -ENODEV; }
-	gpu_id = gi[0].gpu_id;
-	pr_info(PFX "gpu_id 0x%x at %04x:%02x:%02x.%x\n", gpu_id, gi[0].pci_info.domain,
-		gi[0].pci_info.bus, gi[0].pci_info.slot, gi[0].pci_info.function);
+
+	/* Prefer a GPU whose ACPI namespace actually describes a panel. On a
+	   laptop with one dGPU that is gi[0] either way, but taking the first
+	   entry unconditionally picks wrongly the moment a second NVIDIA GPU is
+	   present - an eGPU, or a second card - and the mux is on neither. */
+	pick = 0;
+	if (!acpiid) {
+		for (i = 0; i < n; i++) {
+			NvU32 id = acpi_panel_id(&gi[i]);
+			if (id) { pick = i; acpiid = id; break; }
+		}
+	}
+	gpu_id = gi[pick].gpu_id;
+	pr_info(PFX "gpu_id 0x%x at %04x:%02x:%02x.%x (%u GPU%s, using #%u)\n",
+		gpu_id, gi[pick].pci_info.domain, gi[pick].pci_info.bus,
+		gi[pick].pci_info.slot, gi[pick].pci_info.function,
+		n, n == 1 ? "" : "s", pick);
+	if (!acpiid)
+		pr_warn(PFX "no ACPI panel id found; SET_ACPI_ID_MAPPING will be skipped\n");
+	else
+		pr_info(PFX "acpiId 0x%08x\n", acpiid);
 	kfree(gi);
 
 	if (ops.open_gpu(gpu_id, sp, NV_FALSE)) {
@@ -397,6 +558,10 @@ static void report(NvU32 id, const char *tag)
 static NvV32 do_acpi_map(NvU32 id)
 {
 	AcpiMap *m; NvV32 st;
+	if (!acpiid) {
+		pr_info(PFX "no ACPI panel id, skipping SET_ACPI_ID_MAPPING\n");
+		return 0;
+	}
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	if (!m) return -1;
 	m->mapTable[0].acpiId = acpiid;
@@ -412,6 +577,12 @@ static NvV32 do_acpi_map(NvU32 id)
 static NvV32 do_init(NvU32 id)
 {
 	InitMuxData init; NvV32 st;
+	/* Refuse rather than send ids that are not this panel's: the cost of
+	   being wrong here is a reboot, not an error return. */
+	if (!manfid || !productid) {
+		pr_err(PFX "no panel EDID ids; pass manfid= and productid= (mux-preflight prints them)\n");
+		return -1;
+	}
 	do_acpi_map(id);          /* NVKMS does this first in MuxInit() */
 	memset(&init, 0, sizeof init); init.displayId = id;
 	init.manfId = (u16)manfid; init.productId = (u16)productid;

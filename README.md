@@ -25,6 +25,51 @@ uAPI for dynamic mux switching in 2022; it has not landed.
 
 This switches the panel while the desktop keeps running.
 
+## Portability
+
+Nothing about a particular laptop is compiled in. Everything is derived at
+run time, and each value is printed so a failure says which step could not
+resolve:
+
+| Value | Where it comes from |
+|---|---|
+| Which DRM card is the dGPU / iGPU | PCI vendor id (`0x10de`, `0x8086`, `0x1002`) |
+| The panel's connector on each GPU | the first `eDP-*` on each card |
+| Backlight devices | `nvidia_*` and `intel_backlight` / `amdgpu_bl*` / `acpi_video*` |
+| Panel EDID `manfId`/`productId` | bytes 8..11 of the connector's EDID |
+| RM's `acpiId` for the panel | the dGPU's ACPI `_DOD`, else a display child's `_ADR` |
+| Which NVIDIA GPU to drive | the enumerated GPU whose ACPI namespace has a panel |
+
+DRM card numbering is assignment order, not identity — on the development
+machine the NVIDIA GPU is `card0` and the Intel one `card1`, the reverse of
+what the numbering suggests, and a USB display adapter is enough to renumber
+both. So none of these are fixed paths.
+
+The ACPI id is the one NVIDIA does not derive either. `MuxInit()` in
+`nvkms-rm.c` sets a hard-coded table holding one machine
+(`acpiId = 0x8001a420`), commented as "a poor-man's alternative to the WDDM
+driver's `CDisplayMgr::NVInitializeACPIToDeviceMaskMap()`". The value is in
+firmware: `_DOD` on the GPU's ACPI device returns the display ids the adapter
+drives, and each display child repeats its own in `_ADR`. Bit 31 marks an id
+that follows the ACPI display-device layout, which is what separates it from
+the small indices firmware uses for other children. On the development machine
+both routes return `0x8000A450`, the value that used to be hard-coded.
+
+**Driver version is checked, not assumed.** `nvidia_get_rm_ops()` rejects a
+version mismatch but writes the expected string back, so retrying always
+succeeds — which makes the handshake version-independent and therefore
+worthless as a guard. `nvmuxk` hand-copies `NVOS54_PARAMETERS` and the
+`NV0073_CTRL_*` structs from one release, and a layout change in a later driver
+would compile clean and send wrong bytes to a `KERNEL_PRIVILEGED` control. So
+the module compares the running driver against the release its ABI was read
+from and refuses unless they match. Re-check the structs, update
+`NVMUXK_ABI_VERSION`, or load with `force=1` if you have.
+
+**The panel ids are required, not defaulted.** A failed `INIT_MUX_DATA` wedges
+GSP's mux state until reboot, so sending ids belonging to some other panel is
+worse than sending none. `manfid`/`productid` default to 0 and the module
+refuses the call; `mux-switch` reads them off the connector and passes them.
+
 ## Status and scope
 
 Developed and verified on **one machine**: an Acer Predator PHN16S-71
@@ -79,6 +124,32 @@ variants (see Limitations):
 sudo ./bin/mux-to-dgpu          # switch, then restart the session on the dGPU
 sudo ./bin/mux-to-igpu          # switch back, restart on the iGPU
 ```
+
+## Driving it from a GUI
+
+`systemd/predator-mux-switch@.service` runs the switch as its own unit, taking
+`igpu` or `dgpu` as the instance name:
+
+```sh
+sudo install -Dm644 systemd/predator-mux-switch@.service \
+    /etc/systemd/system/predator-mux-switch@.service
+sudo systemctl daemon-reload
+sudo systemctl start predator-mux-switch@dgpu.service
+```
+
+It exists because a desktop control panel usually cannot run the helper itself.
+A daemon written to be safe to leave running as root is normally sandboxed, and
+`ProtectKernelModules=true` -- or simply not holding `CAP_SYS_MODULE` -- makes
+`insmod nvmuxk.ko` return `EPERM`, so the helper aborts at its first step. This
+unit keeps the privileged part in one place with an explicit scope: it accepts
+exactly two instance names, and the daemon that starts it keeps every one of its
+own restrictions.
+
+Start it with `--no-block` from anything that has a response deadline. A switch
+takes several seconds including the probe loop, and this unit deliberately runs
+the helper in the foreground -- a `oneshot` that returned early would have its
+detached child reaped with the cgroup, mid-switch, with the panel owned by
+neither GPU.
 
 ## How it works
 
@@ -155,8 +226,8 @@ poor-man's alternative to the WDDM driver's
   There is no in-tree way to hand a panel to another driver while it
   self-refreshes; that is what the unlanded DRM mux uAPI was for.
 - Wayland and KWin only. Other compositors are untested.
-- Panel EDID ids are compile-time defaults. Other panels must pass `manfid=`
-  and `productid=`; preflight prints the correct values.
+- Verified on one machine. Everything machine-specific is derived rather than
+  compiled in (see "Portability"), but derived is not the same as tested.
 
 ## Author
 
