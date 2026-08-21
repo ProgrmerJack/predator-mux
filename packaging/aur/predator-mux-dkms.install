@@ -1,0 +1,28 @@
+_module=predator-mux
+
+post_install() {
+    dkms add     -m "$_module" -v "$1" >/dev/null 2>&1 || true
+    dkms build   -m "$_module" -v "$1" || return 0
+    dkms install -m "$_module" -v "$1" || return 0
+    cat <<'EOF'
+
+  Run mux-preflight before switching anything:
+
+      sudo mux-preflight
+
+  It refuses rather than guesses. A failed INIT_MUX_DATA wedges the GPU's mux
+  state until reboot, so do not skip it. Keep a way back in - a second TTY, SSH,
+  or a filesystem snapshot - the first time you switch.
+
+EOF
+}
+
+post_upgrade() {
+    pre_remove "$2"
+    post_install "$1"
+}
+
+pre_remove() {
+    modprobe -r nvmuxk 2>/dev/null || true
+    dkms remove -m "$_module" -v "$1" --all >/dev/null 2>&1 || true
+}

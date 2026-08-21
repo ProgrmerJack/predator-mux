@@ -61,8 +61,6 @@ fi
 BINDIR=$(dirname -- "$MUX_SELF")
 ROOTDIR=$(CDPATH= cd -- "$BINDIR/.." && pwd)
 DIR="$ROOTDIR/kernel"
-# Fall back to an installed module if this is not a source checkout.
-[ -f "$DIR/nvmuxk.ko" ] || DIR="/lib/modules/$(uname -r)/updates"
 LOGDIR="${MUX_LOG_DIR:-/var/log/predator-mux}"
 mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR=/tmp
 
@@ -128,6 +126,19 @@ fi
 
 log() { echo "$@" >> "$LOGF"; sync; }
 
+# Loading the module: a source checkout has an uncompressed nvmuxk.ko next to
+# these scripts, but a packaged install puts it in the kernel's module tree
+# where it is usually compressed (nvmuxk.ko.zst under DKMS). insmod cannot read
+# a compressed module and does not search the tree, so modprobe is preferred
+# whenever the module is installed, and insmod is only the source-tree path.
+load_nvmuxk() {
+    if [ -f "$DIR/nvmuxk.ko" ]; then
+        insmod "$DIR/nvmuxk.ko" $MODARGS
+    else
+        modprobe nvmuxk $MODARGS
+    fi
+}
+
 # --- direction -------------------------------------------------------------
 if [ "$TARGET" = dgpu ] || [ "$TARGET" = igpu ]; then
     WANT=$TARGET
@@ -184,7 +195,7 @@ bl_set_pct() {
 # it inside the NVIDIA RM. Doing it before the panel is released keeps that time
 # out of the dark window entirely. Nothing here touches the display.
 rmmod nvmuxk 2>/dev/null
-if ! insmod "$DIR/nvmuxk.ko" $MODARGS; then
+if ! load_nvmuxk; then
     log "insmod FAILED - panel untouched, aborting"
     log "=== aborted $(date -Is) ==="
     exit 1
@@ -252,7 +263,7 @@ if [ "$(cat $TO_CONN/status)" = connected ]; then
 else
     log "FAILED: $(basename $TO_CONN) is $(cat $TO_CONN/status) - reverting"
     rmmod nvmuxk 2>/dev/null
-    if insmod "$DIR/nvmuxk.ko" $MODARGS 2>/dev/null; then
+    if load_nvmuxk 2>/dev/null; then
         # Full sequence, not sw-*: RUN_PRE/RUN_POST are what bring the connector
         # up, so the recovery path must use them too or it can leave the panel
         # dark.

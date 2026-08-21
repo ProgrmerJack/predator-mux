@@ -99,6 +99,8 @@ Keep a way back in: a second TTY, SSH, or a filesystem snapshot.
 
 ## Install
 
+From source:
+
 ```sh
 git clone https://github.com/ProgrmerJack/predator-mux
 cd predator-mux
@@ -106,13 +108,50 @@ make -C kernel
 sudo ./bin/mux-preflight        # must print PASS
 ```
 
+Or as a DKMS package, so the module survives kernel upgrades. `packaging/aur/`
+holds a PKGBUILD:
+
+```sh
+cd packaging/aur && makepkg -si
+sudo mux-preflight              # must print PASS
+```
+
+`make -C kernel` builds `nvmuxk` against the running kernel; DKMS builds it for
+each installed one. Either way `kernel/nvidia.symvers` is generated rather than
+shipped -- see below.
+
+### Why nvidia.symvers is generated
+
+`nvmuxk` calls `nvidia_get_rm_ops`, exported by `nvidia.ko`. Building an
+out-of-tree module against another module's symbol needs that symbol in a
+`Module.symvers`-format file, or modpost reports it undefined. The CRC in that
+file is not decoration: on a `CONFIG_MODVERSIONS` kernel it is recorded in the
+module's `__versions` section and compared against the exporting module at
+load. A hardcoded `0` loads fine on a kernel built without MODVERSIONS and is
+rejected with "disagrees about version of symbol" on one built with it.
+
+`kernel/gen-symvers.sh` reads it from the installed `nvidia.ko` instead --
+decompressing `.ko.zst`/`.xz`/`.gz` as needed, and taking the value of the
+absolute `__crc_nvidia_get_rm_ops` symbol that modpost emits when MODVERSIONS
+is on. When that symbol is absent the kernel was built without MODVERSIONS and
+`0` is then the correct answer rather than a fallback. DKMS passes
+`$kernelver`, so a build for a kernel that is not booted reads that kernel's
+driver, not the running one's.
+
+Only the **open** kernel modules export `nvidia_get_rm_ops`. The
+proprietary-only build does not, and preflight says so rather than failing at
+link time.
+
 ## Use
 
 ```sh
-sudo ./bin/mux-switch dgpu      # panel -> NVIDIA, session preserved
-sudo ./bin/mux-switch igpu      # panel -> Intel
-sudo ./bin/mux-switch           # toggle
+sudo mux-switch dgpu            # panel -> NVIDIA, session preserved
+sudo mux-switch igpu            # panel -> Intel
+sudo mux-switch                 # toggle
 ```
+
+From a source checkout the same commands are `sudo ./bin/mux-switch ...`. The
+scripts resolve their own location, so both work.
 
 Both directions auto-revert if the panel does not come back, and fall back to a
 compositor restart only if that also fails. Logs go to `/var/log/predator-mux`.
@@ -136,6 +175,10 @@ sudo install -Dm644 systemd/predator-mux-switch@.service \
 sudo systemctl daemon-reload
 sudo systemctl start predator-mux-switch@dgpu.service
 ```
+
+The package installs it already. The unit finds `mux-switch` under
+`/usr/lib`, `/usr/local/lib` or `/opt`, so a packaged and a manual install both
+work without editing it.
 
 It exists because a desktop control panel usually cannot run the helper itself.
 A daemon written to be safe to leave running as root is normally sandboxed, and

@@ -1,0 +1,52 @@
+# Maintainer: Abduxoliq Ashuraliyev <ProgrmerJack at users dot noreply dot github dot com>
+
+pkgname=predator-mux-dkms
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Runtime display-MUX switching for NVIDIA Advanced Optimus laptops, without restarting the session"
+arch=('x86_64')
+url="https://github.com/ProgrmerJack/predator-mux"
+license=('MIT')
+depends=('dkms' 'systemd' 'kmod')
+# nvmuxk links against nvidia_get_rm_ops, which only the open kernel modules
+# export; the proprietary-only build does not have it. Any package providing
+# them will do, so this is a note rather than a depends= entry that would pin
+# users to one flavour.
+optdepends=('nvidia-open-dkms: provides the exported nvidia_get_rm_ops nvmuxk needs'
+            'nvidia-open: same, prebuilt for the stock kernel'
+            'acpi_call-dkms: lets mux-preflight report which mux chip is fitted')
+provides=('predator-mux')
+conflicts=('predator-mux')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "predator-mux-${pkgver}"
+
+  # DKMS source. nvidia.symvers is deliberately absent: it is generated at build
+  # time from the nvidia.ko belonging to the kernel being built for, because a
+  # wrong CRC is rejected at load on a CONFIG_MODVERSIONS kernel.
+  local src="${pkgdir}/usr/src/predator-mux-${pkgver}"
+  install -Dm644 kernel/nvmuxk.c      "${src}/nvmuxk.c"
+  install -Dm644 kernel/Makefile      "${src}/Makefile"
+  install -Dm644 kernel/dkms.conf     "${src}/dkms.conf"
+  install -Dm755 kernel/gen-symvers.sh "${src}/gen-symvers.sh"
+  sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${pkgver}\"/" "${src}/dkms.conf"
+
+  # The helpers resolve their own location, so they work from here unchanged.
+  for b in mux-switch mux-preflight mux-to-dgpu mux-to-igpu; do
+    install -Dm755 "bin/${b}" "${pkgdir}/usr/lib/predator-mux/bin/${b}"
+  done
+  # On PATH as well, for people who would rather type the name.
+  install -d "${pkgdir}/usr/bin"
+  for b in mux-switch mux-preflight; do
+    ln -s "/usr/lib/predator-mux/bin/${b}" "${pkgdir}/usr/bin/${b}"
+  done
+
+  install -Dm644 systemd/predator-mux-switch@.service \
+    "${pkgdir}/usr/lib/systemd/system/predator-mux-switch@.service"
+
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 LICENSE   "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -1,23 +1,32 @@
 [Unit]
 Description=Move the internal panel to the %i GPU
 Documentation=https://github.com/ProgrmerJack/predator-mux
-ConditionPathExists=/usr/local/lib/predator-mux/bin/mux-switch
+# OR'd: a package install lands in /usr/lib, a manual one in /usr/local/lib.
+ConditionPathExists=|/usr/lib/predator-mux/bin/mux-switch
+ConditionPathExists=|/usr/local/lib/predator-mux/bin/mux-switch
+ConditionPathExists=|/opt/predator-mux/bin/mux-switch
 
 [Service]
 Type=oneshot
-# ASense's control daemon runs under ProtectKernelModules=true with only
-# CAP_SYS_ADMIN, so insmod inside it returns EPERM and the helper aborts at its
-# first step. The switch is delegated here instead of loosening that sandbox:
-# this unit is the only privileged surface, it accepts exactly two instance
-# names, and the always-running daemon keeps every one of its restrictions.
+# A desktop control daemon usually cannot run the helper itself. One written to
+# be safe to leave running as root is sandboxed, and ProtectKernelModules=true
+# -- or simply not holding CAP_SYS_MODULE -- makes the helper's first step,
+# loading the module that reaches NVIDIA's Resource Manager at kernel
+# privilege, return EPERM. The switch is delegated here rather than by
+# loosening that sandbox: this unit is the only privileged surface, it accepts
+# exactly two instance names, and the caller keeps every one of its own
+# restrictions.
 #
-# CHILD=1 runs the helper inline rather than through its own setsid detach.
-# A detached child would be outside the ExecStart process, so systemd would
-# reap it with the cgroup the moment this oneshot returned - mid-switch, with
-# the panel owned by neither GPU.
+# CHILD=1 runs the helper inline rather than through its own setsid detach. A
+# detached child would be outside the ExecStart process, so systemd would reap
+# it with the cgroup the moment this oneshot returned - mid-switch, with the
+# panel owned by neither GPU.
 ExecStart=/bin/sh -c '\
 case "$1" in igpu|dgpu) ;; *) echo "target must be igpu or dgpu" >&2; exit 2 ;; esac; \
-self=/usr/local/lib/predator-mux/bin/mux-switch; \
+for d in /usr/lib /usr/local/lib /opt; do \
+    [ -x "$d/predator-mux/bin/mux-switch" ] && self="$d/predator-mux/bin/mux-switch" && break; \
+done; \
+[ -n "$self" ] || { echo "mux-switch is not installed" >&2; exit 3; }; \
 mkdir -p /var/log/predator-mux; \
 exec env CHILD=1 TARGET="$1" MUX_SELF="$self" \
      LOGF="/var/log/predator-mux/live-$(date +%%Y%%m%%d-%%H%%M%%S).log" "$self"' \
